@@ -141,6 +141,46 @@ func (cfg *apiConfig) getChirpHandler(rw http.ResponseWriter, req *http.Request)
 	json.NewEncoder(rw).Encode(chirpResponse)
 }
 
+func (cfg *apiConfig) deleteChirpHandler(rw http.ResponseWriter, req *http.Request) {
+	chirpIDString := req.PathValue("chirpID")
+	if chirpIDString == "" {
+		rw.WriteHeader(400)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Chirp ID is required"})
+		return
+	}
+	chirpID, err := uuid.Parse(chirpIDString)
+	if err != nil {
+		rw.WriteHeader(400)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Invalid Chirp ID"})
+		return
+	}
+	chirp, err := cfg.queries.GetChirp(req.Context(), chirpID)
+	if err != nil {
+		rw.WriteHeader(404)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Not found"})
+		return
+	}
+
+	token, _ := auth.GetBearerToken(req.Header)
+	userId, _ := auth.ValidateJWT(token, cfg.jwtSecret)
+
+	if chirp.UserID != userId {
+		rw.WriteHeader(403)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Forbidden"})
+		return
+	}
+
+	err = cfg.queries.DeleteChirpById(req.Context(), chirpID)
+	if err != nil {
+		rw.WriteHeader(500)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Internal server errror"})
+		return
+	}
+
+	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rw.WriteHeader(204)
+}
+
 func (cfg *apiConfig) createChirpHandler(rw http.ResponseWriter, req *http.Request) {
 	var chirpRequest CreateChirpRequest
 	err := json.NewDecoder(req.Body).Decode(&chirpRequest)
@@ -300,6 +340,58 @@ func (cfg *apiConfig) loginUserHandler(rw http.ResponseWriter, req *http.Request
 	json.NewEncoder(rw).Encode(user)
 }
 
+func (cfg *apiConfig) updateUserHandler(rw http.ResponseWriter, req *http.Request) {
+	var requestBody UserRequest
+	err := json.NewDecoder(req.Body).Decode(&requestBody)
+	if err != nil {
+		rw.WriteHeader(400)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Invalid request"})
+		return
+	}
+	token, _ := auth.GetBearerToken(req.Header)
+	userId, _ := auth.ValidateJWT(token, cfg.jwtSecret)
+	newHashedPassword, err := auth.HashPassword(requestBody.Password)
+	if err != nil {
+		rw.WriteHeader(401)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Unable to hash password"})
+		return
+	}
+	userEntity, err := cfg.queries.UpdateUserEmailAndPassoword(req.Context(), database.UpdateUserEmailAndPassowordParams{Email: requestBody.Email, HashedPassword: newHashedPassword, ID: userId})
+	if err != nil {
+		rw.WriteHeader(401)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Unable to update user"})
+		return
+	}
+	tokenExpiration := time.Hour
+
+	newToken, err := auth.MakeJWT(userId, cfg.jwtSecret, tokenExpiration)
+	if err != nil {
+		rw.WriteHeader(500)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Unable to create JWT token"})
+		return
+	}
+
+	refreshToken, _ := auth.MakeRefreshToken()
+
+	cfg.queries.CreateRefreshToken(req.Context(), database.CreateRefreshTokenParams{
+		Token:     refreshToken,
+		UserID:    userId,
+		ExpiresAt: time.Now().Add(60 * 24 * time.Hour),
+	})
+
+	user := UserReponse{
+		Id:           userId,
+		CreatedAt:    userEntity.CreatedAt.Time.String(),
+		UpdatedAt:    userEntity.UpdatedAt.Time.String(),
+		Email:        userEntity.Email,
+		Token:        newToken,
+		RefreshToken: refreshToken,
+	}
+	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rw.WriteHeader(200)
+	json.NewEncoder(rw).Encode(user)
+}
+
 func (cfg *apiConfig) refreshTokenHandler(rw http.ResponseWriter, req *http.Request) {
 	rw.Header().Set("Content-Type", "application/json")
 	refreshToken, err := auth.GetBearerToken(req.Header)
@@ -375,10 +467,12 @@ func main() {
 	mux.Handle("POST /api/chirps", apiCfg.middlewareAuth(http.HandlerFunc(apiCfg.createChirpHandler)))
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirpsHandler)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpHandler)
+	mux.Handle("DELETE /api/chirps/{chirpID}", apiCfg.middlewareAuth(http.HandlerFunc(apiCfg.deleteChirpHandler)))
 	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
 	mux.HandleFunc("POST /api/login", apiCfg.loginUserHandler)
 	mux.HandleFunc("POST /api/refresh", apiCfg.refreshTokenHandler)
 	mux.HandleFunc("POST /api/revoke", apiCfg.revokeTokenHandler)
+	mux.Handle("PUT /api/users", apiCfg.middlewareAuth(http.HandlerFunc(apiCfg.updateUserHandler)))
 	server := http.Server{
 		Handler: mux,
 		Addr:    ":8080",
