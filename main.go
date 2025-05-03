@@ -15,6 +15,7 @@ import (
 	"github.com/kyrnas/chirpy/internal/auth"
 	"github.com/kyrnas/chirpy/internal/database"
 	_ "github.com/lib/pq"
+	"golang.org/x/exp/slices"
 )
 
 type apiConfig struct {
@@ -23,6 +24,7 @@ type apiConfig struct {
 	queries        *database.Queries
 	platform       string
 	jwtSecret      string
+	polkaKey       string
 }
 
 type CreateChirpRequest struct {
@@ -47,12 +49,20 @@ type UserReponse struct {
 	CreatedAt    string    `json:"created_at"`
 	UpdatedAt    string    `json:"updated_at"`
 	Email        string    `json:"email"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
 }
 
 type RefreshTokenResponse struct {
 	Token string `json:"token"`
+}
+
+type PolkaEvent struct {
+	Event string `json:"event"`
+	Data  struct {
+		UserId uuid.UUID `json:"user_id"`
+	} `json:"data"`
 }
 
 type ErrorResponse struct {
@@ -66,7 +76,7 @@ func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
 	})
 }
 
-func (cfg *apiConfig) middlewareAuth(next http.Handler) http.Handler {
+func (cfg *apiConfig) middlewareJWTAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		token, err := auth.GetBearerToken(req.Header)
 		if err != nil {
@@ -84,12 +94,48 @@ func (cfg *apiConfig) middlewareAuth(next http.Handler) http.Handler {
 	})
 }
 
+func (cfg *apiConfig) middlewareKeyAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		apiKey, err := auth.GetAPIKey(req.Header)
+		if err != nil {
+			rw.WriteHeader(401)
+			json.NewEncoder(rw).Encode((ErrorResponse{Error: "API Key not present"}))
+			return
+		}
+		if apiKey != cfg.polkaKey {
+			rw.WriteHeader(401)
+			json.NewEncoder(rw).Encode((ErrorResponse{Error: "API Key is invalid"}))
+			return
+		}
+		next.ServeHTTP(rw, req)
+	})
+}
+
 func (cfg *apiConfig) getChirpsHandler(rw http.ResponseWriter, req *http.Request) {
-	chirps, err := cfg.queries.GetAllChirps(req.Context())
+	authorId := req.URL.Query().Get("author_id")
+	var chirps []database.Chirp
+	var err error
+	if authorId == "" {
+		chirps, err = cfg.queries.GetAllChirps(req.Context())
+	} else {
+		authorUUID, err := uuid.Parse(authorId)
+		if err != nil {
+			rw.WriteHeader(400)
+			json.NewEncoder(rw).Encode(ErrorResponse{Error: "Invalid author ID"})
+			return
+		}
+		chirps, err = cfg.queries.GetAllChirpsByAuthor(req.Context(), authorUUID)
+	}
 	if err != nil {
 		rw.WriteHeader(500)
 		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Internal server error"})
 		return
+	}
+	sortOrder := req.URL.Query().Get("sort")
+	if sortOrder == "desc" {
+		slices.SortFunc(chirps, func(i, j database.Chirp) int {
+			return j.CreatedAt.Time.Compare(i.CreatedAt.Time)
+		})
 	}
 	var chirpResponse []ChirpReponse
 
@@ -279,10 +325,11 @@ func (cfg *apiConfig) createUserHandler(rw http.ResponseWriter, req *http.Reques
 		return
 	}
 	user := UserReponse{
-		Id:        dbUser.ID,
-		CreatedAt: dbUser.CreatedAt.Time.String(),
-		UpdatedAt: dbUser.UpdatedAt.Time.String(),
-		Email:     dbUser.Email,
+		Id:          dbUser.ID,
+		CreatedAt:   dbUser.CreatedAt.Time.String(),
+		UpdatedAt:   dbUser.UpdatedAt.Time.String(),
+		Email:       dbUser.Email,
+		IsChirpyRed: dbUser.IsChirpyRed.Bool,
 	}
 	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
 	rw.WriteHeader(201)
@@ -332,6 +379,7 @@ func (cfg *apiConfig) loginUserHandler(rw http.ResponseWriter, req *http.Request
 		CreatedAt:    dbUser.CreatedAt.Time.String(),
 		UpdatedAt:    dbUser.UpdatedAt.Time.String(),
 		Email:        dbUser.Email,
+		IsChirpyRed:  dbUser.IsChirpyRed.Bool,
 		Token:        token,
 		RefreshToken: refreshToken,
 	}
@@ -384,12 +432,35 @@ func (cfg *apiConfig) updateUserHandler(rw http.ResponseWriter, req *http.Reques
 		CreatedAt:    userEntity.CreatedAt.Time.String(),
 		UpdatedAt:    userEntity.UpdatedAt.Time.String(),
 		Email:        userEntity.Email,
+		IsChirpyRed:  userEntity.IsChirpyRed.Bool,
 		Token:        newToken,
 		RefreshToken: refreshToken,
 	}
 	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
 	rw.WriteHeader(200)
 	json.NewEncoder(rw).Encode(user)
+}
+
+func (cfg *apiConfig) upgradeChirpyRedHandler(rw http.ResponseWriter, req *http.Request) {
+	rw.Header().Set("Content-Type", "application/json")
+	var polkaEvent PolkaEvent
+	err := json.NewDecoder(req.Body).Decode(&polkaEvent)
+	if err != nil {
+		rw.WriteHeader(400)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "Unable to decode body"})
+		return
+	}
+	if polkaEvent.Event != "user.upgraded" {
+		rw.WriteHeader(204)
+		return
+	}
+	_, err = cfg.queries.UpgradeChirpyRedById(req.Context(), database.UpgradeChirpyRedByIdParams{IsChirpyRed: sql.NullBool{Bool: true, Valid: true}, ID: polkaEvent.Data.UserId})
+	if err != nil {
+		rw.WriteHeader(404)
+		json.NewEncoder(rw).Encode(ErrorResponse{Error: "User not found"})
+		return
+	}
+	rw.WriteHeader(204)
 }
 
 func (cfg *apiConfig) refreshTokenHandler(rw http.ResponseWriter, req *http.Request) {
@@ -450,29 +521,30 @@ func main() {
 	dbQueries := database.New(db)
 
 	platform := os.Getenv("PLATFORM")
-
 	jwtSecret := os.Getenv("JWT_SECRET")
+	polkaKey := os.Getenv("POLKA_KEY")
 
 	apiCfg := &apiConfig{fileserverHits: atomic.Int32{}, profanities: map[string]bool{
 		"kerfuffle": true,
 		"sharbert":  true,
 		"fornax":    true,
-	}, queries: dbQueries, platform: platform, jwtSecret: jwtSecret}
+	}, queries: dbQueries, platform: platform, jwtSecret: jwtSecret, polkaKey: polkaKey}
 
 	mux := http.NewServeMux()
 	mux.Handle("/app/", http.StripPrefix("/app", apiCfg.middlewareMetricsInc(http.FileServer(http.Dir(".")))))
 	mux.HandleFunc("GET /api/healthz", healthHandler)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHandler)
-	mux.Handle("POST /api/chirps", apiCfg.middlewareAuth(http.HandlerFunc(apiCfg.createChirpHandler)))
+	mux.Handle("POST /api/chirps", apiCfg.middlewareJWTAuth(http.HandlerFunc(apiCfg.createChirpHandler)))
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirpsHandler)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirpHandler)
-	mux.Handle("DELETE /api/chirps/{chirpID}", apiCfg.middlewareAuth(http.HandlerFunc(apiCfg.deleteChirpHandler)))
+	mux.Handle("DELETE /api/chirps/{chirpID}", apiCfg.middlewareJWTAuth(http.HandlerFunc(apiCfg.deleteChirpHandler)))
 	mux.HandleFunc("POST /api/users", apiCfg.createUserHandler)
 	mux.HandleFunc("POST /api/login", apiCfg.loginUserHandler)
 	mux.HandleFunc("POST /api/refresh", apiCfg.refreshTokenHandler)
 	mux.HandleFunc("POST /api/revoke", apiCfg.revokeTokenHandler)
-	mux.Handle("PUT /api/users", apiCfg.middlewareAuth(http.HandlerFunc(apiCfg.updateUserHandler)))
+	mux.Handle("PUT /api/users", apiCfg.middlewareJWTAuth(http.HandlerFunc(apiCfg.updateUserHandler)))
+	mux.Handle("POST /api/polka/webhooks", apiCfg.middlewareKeyAuth(http.HandlerFunc(apiCfg.upgradeChirpyRedHandler)))
 	server := http.Server{
 		Handler: mux,
 		Addr:    ":8080",
